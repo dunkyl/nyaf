@@ -15,7 +15,7 @@ let prettySerializeopts=
 
 let cacheDir = Environment.ExpandEnvironmentVariables "%localappdata%" /+ "nyaf" /+ "cache"
 
-// TODO: setuo runtime config template and FSharp.Core.dll
+// TODO: setup runtime config template and FSharp.Core.dll
 let cacheFile = cacheDir /+ "cache.json"
 if not (Directory.Exists cacheDir) then
         Directory.CreateDirectory cacheDir
@@ -28,9 +28,12 @@ type GlobalDotnetOptions = {
 }
 
 let globalDotnetOptions = 
-    "global.json"
-    |> File.ReadAllText
-    |> JsonSerializer.Deserialize<GlobalDotnetOptions>
+    if File.Exists "global.json" then
+        "global.json"
+        |> File.ReadAllText
+        |> JsonSerializer.Deserialize<GlobalDotnetOptions>
+    // TODO: discover sdk version
+    else { sdk = {| version = "6.0.403" |} }
 
 type Options = {
     script: string 
