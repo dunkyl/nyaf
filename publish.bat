@@ -1,0 +1,1 @@
+dotnet publish -c Release --use-current-runtime -o .
