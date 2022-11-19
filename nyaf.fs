@@ -33,7 +33,7 @@ let globalDotnetOptions =
         |> File.ReadAllText
         |> JsonSerializer.Deserialize<GlobalDotnetOptions>
     // TODO: discover sdk version
-    else { sdk = {| version = "6.0.403" |} }
+    else { sdk = {| version = "7.0.100" |} }
 
 type Options = {
     script: string 
