@@ -27,13 +27,31 @@ type GlobalDotnetOptions = {
     sdk: {| version: string |}
 }
 
+let latestSdk =
+    let proc = new ProcessStartInfo(
+        "dotnet",
+        Arguments = "--list-sdks",
+        RedirectStandardOutput = true
+
+    )
+    let result = Process.Start(proc)
+    result.WaitForExit()
+    if result.ExitCode <> 0 then
+        printfn "dotnet version discovery failed"
+    let versions_raw  = result.StandardOutput.ReadToEnd()
+    let versions = versions_raw.Split('\n') |> Array.map (fun s -> s.Split(' ')[0]) |> Array.map (fun s -> s.Trim(' ')) |> Array.filter (fun s -> s <> "" && not (s.StartsWith "7"))
+    if versions.Length = 0 then
+        printfn "No compatible SDK versions were found."
+        exit 1
+    Seq.head (Seq.sort versions)
+
 let globalDotnetOptions = 
     if File.Exists "global.json" then
         "global.json"
         |> File.ReadAllText
         |> JsonSerializer.Deserialize<GlobalDotnetOptions>
     // TODO: discover sdk version
-    else { sdk = {| version = "7.0.100" |} }
+    else { sdk = {| version = latestSdk |} }
 
 type Options = {
     script: string 
@@ -148,7 +166,7 @@ match opts with
         let sdkpath = "C:/Program Files/dotnet/sdk" /+ globalDotnetOptions.sdk.version
         let buildargs = [
             "\"" + sdkpath /+ "FSharp/fsc.dll" + "\""
-            "--targetprofile:netcore"
+            "--targetprofile:netstandard"
             "--langversion:6.0"
             if not opts.verbose then "--nologo"
             $"--out:{exe}"
