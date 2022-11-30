@@ -27,6 +27,8 @@ type GlobalDotnetOptions = {
     sdk: {| version: string |}
 }
 
+let mutable cryptography_workaround = false
+
 let latestSdk =
     let proc = new ProcessStartInfo(
         "dotnet",
@@ -39,11 +41,14 @@ let latestSdk =
     if result.ExitCode <> 0 then
         printfn "dotnet version discovery failed"
     let versions_raw  = result.StandardOutput.ReadToEnd()
-    let versions = versions_raw.Split('\n') |> Array.map (fun s -> s.Split(' ')[0]) |> Array.map (fun s -> s.Trim(' ')) |> Array.filter (fun s -> s <> "" && not (s.StartsWith "7"))
+    let versions = versions_raw.Split('\n') |> Array.map (fun s -> s.Split(' ')[0]) |> Array.map (fun s -> s.Trim(' ')) |> Array.filter (fun s -> s <> "")
     if versions.Length = 0 then
         printfn "No compatible SDK versions were found."
         exit 1
-    Seq.head (Seq.sort versions)
+    let topver = Seq.sort versions |> Seq.sort |> Seq.rev |> Seq.head
+    cryptography_workaround <- topver.StartsWith("7")
+    printfn $"Using dotnet {topver}"
+    topver
 
 let globalDotnetOptions = 
     if File.Exists "global.json" then
@@ -130,7 +135,7 @@ match opts with
             |> Map.ofArray
 
 
-    let script = Path.GetFullPath "." /+ opts.script
+    let mutable script = Path.GetFullPath "." /+ opts.script
 
     let hashFile = File.ReadAllBytes  >> Cryptography.SHA256.HashData >> BitConverter.ToString >> fun s -> s.Replace("-", "")
     
@@ -148,6 +153,13 @@ match opts with
 
     let exe = outputDir /+ $"{thisHash}.exe"
     let cfg = outputDir /+ $"{thisHash}.runtimeconfig.json"
+
+    if cryptography_workaround then
+        let fsx_tmp = outputDir /+ $"{thisHash}.fsx"
+        let text = File.ReadAllText(opts.script)
+        let workaround = "#r \"System.Security.Cryptography\""
+        File.WriteAllText(fsx_tmp, workaround+"\n"+text)
+        script <- fsx_tmp
 
     let cache' = Map.tryFind script caches
     let cacheDone = DateTime.Now
@@ -167,7 +179,7 @@ match opts with
         let buildargs = [
             "\"" + sdkpath /+ "FSharp/fsc.dll" + "\""
             "--targetprofile:netstandard"
-            "--langversion:6.0"
+            "--langversion:7.0"
             if not opts.verbose then "--nologo"
             $"--out:{exe}"
             script
