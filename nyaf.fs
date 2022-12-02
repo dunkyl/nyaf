@@ -3,8 +3,9 @@ open System.IO
 open System.Security
 open System.Text.Json
 open System.Diagnostics
+open type System.Environment
 
-let start = DateTime.Now
+let startTime = DateTime.Now
 
 let (/+) l r = Path.Combine(l, r)
 
@@ -13,7 +14,22 @@ let prettySerializeopts=
         WriteIndented = true
     )
 
-let cacheDir = Environment.ExpandEnvironmentVariables "%localappdata%" /+ "nyaf" /+ "cache"
+let cacheDir = ExpandEnvironmentVariables "%localappdata%" /+ "nyaf" /+ "cache"
+
+let run exe args =
+    let result = Process.Start(new ProcessStartInfo(
+        exe, args,
+        RedirectStandardOutput = true
+    ))
+    result.WaitForExit()
+    if result.ExitCode <> 0 then
+        printfn $"Error running {exe} {args}"
+        Console.ForegroundColor <- ConsoleColor.Red
+        printfn $"{result.StandardError.ReadToEnd()}"
+        Console.ResetColor()
+        exit result.ExitCode
+    else
+        result.StandardOutput.ReadToEnd()
 
 // TODO: setup runtime config template and FSharp.Core.dll
 let cacheFile = cacheDir /+ "cache.json"
@@ -23,40 +39,15 @@ if not (Directory.Exists cacheDir) then
 
 let usage = "usage: nyaf <options> <fsx script> <script args>"
 
-type GlobalDotnetOptions = {
-    sdk: {| version: string |}
-}
+let dotnetVersion = (run "dotnet" "--version").Trim()
 
-let mutable cryptography_workaround = false
 
-let latestSdk =
-    let proc = new ProcessStartInfo(
-        "dotnet",
-        Arguments = "--list-sdks",
-        RedirectStandardOutput = true
-
-    )
-    let result = Process.Start(proc)
-    result.WaitForExit()
-    if result.ExitCode <> 0 then
-        printfn "dotnet version discovery failed"
-    let versions_raw  = result.StandardOutput.ReadToEnd()
-    let versions = versions_raw.Split('\n') |> Array.map (fun s -> s.Split(' ')[0]) |> Array.map (fun s -> s.Trim(' ')) |> Array.filter (fun s -> s <> "")
-    if versions.Length = 0 then
-        printfn "No compatible SDK versions were found."
-        exit 1
-    let topver = Seq.sort versions |> Seq.sort |> Seq.rev |> Seq.head
-    cryptography_workaround <- topver.StartsWith("7")
-    printfn $"Using dotnet {topver}"
-    topver
-
-let globalDotnetOptions = 
-    if File.Exists "global.json" then
-        "global.json"
-        |> File.ReadAllText
-        |> JsonSerializer.Deserialize<GlobalDotnetOptions>
-    // TODO: discover sdk version
-    else { sdk = {| version = latestSdk |} }
+let findSdkDir (ver: string) =
+    let sdk = // like 'X.0.0 [/path/to/sdk]'
+        (run "dotnet" "--list-sdks").Split('\n')
+        |> Seq.find (fun s -> s.StartsWith ver)
+    (sdk.Split(' ')[1]).Trim('[', ']') // just containing folder
+    /+ ver
 
 type Options = {
     script: string 
@@ -64,8 +55,6 @@ type Options = {
     buildOnly: bool
     passedArgs: string list
     verbose: bool
-    noMangle: bool
-    outputDir: string option
 }
     with static member Default = {
             script = ""
@@ -73,8 +62,6 @@ type Options = {
             buildOnly = false
             passedArgs = []
             verbose = false
-            noMangle = false
-            outputDir = None
         }
 
 type ScriptCache = {
@@ -94,11 +81,6 @@ let rec parseOptions opts args =
         parseOptions { opts with buildOnly = true } rest
     | ("--verbose"|"-v")::rest ->
         parseOptions { opts with verbose = true } rest
-    // | ("--no-mangle"|"-n")::rest ->
-    //     printfn "Mangling disabled"
-    //     parseOptions { opts with noMangle = true } rest
-    | ("--output"|"-o")::path::rest ->
-        parseOptions { opts with outputDir = Some path; noMangle = true } rest
     | path::rest 
         when path.EndsWith ".fsx" ->
         if File.Exists path then
@@ -113,7 +95,7 @@ let rec parseOptions opts args =
     | unknown::_ ->
         Error $"unknown option '{unknown}'"
 
-let clargs = Environment.GetCommandLineArgs()  |> Array.skip 1
+let clargs = GetCommandLineArgs()  |> Array.skip 1
 let opts = parseOptions Options.Default (clargs |> List.ofArray)
 
 let startupDone = DateTime.Now
@@ -121,7 +103,7 @@ let startupDone = DateTime.Now
 match opts with
 | Ok opts ->
     let printIfVerbose = if opts.verbose then printfn "%s" else ignore
-    printIfVerbose $"startup time: {startupDone - start}"
+    printIfVerbose $"startup time: {startupDone - startTime}"
     printIfVerbose ("Args: " + String.Join(" ", clargs))
     printIfVerbose ("Args to pass on: " + String.Join(" ", opts.passedArgs))
     let caches =
@@ -135,71 +117,54 @@ match opts with
             |> Map.ofArray
 
 
-    let mutable script = Path.GetFullPath "." /+ opts.script
+    let script = Path.GetFullPath "." /+ opts.script
 
-    let hashFile = File.ReadAllBytes  >> Cryptography.SHA256.HashData >> BitConverter.ToString >> fun s -> s.Replace("-", "")
+    let hashFile = File.ReadAllBytes >> Cryptography.SHA256.HashData >> BitConverter.ToString >> fun s -> s.Replace("-", "")
     
-    let thisHash = 
-        if opts.noMangle then
-            opts.script.Replace(".fsx", "")
-        else
-            let hash = hashFile script
-            hash
+    let scriptHash = hashFile script
 
-    let outputDir = 
-        match opts.outputDir with
-        | Some path -> path
-        | None -> cacheDir
+    let exe = cacheDir /+ $"{scriptHash}.exe"
+    let cfg = cacheDir /+ $"{scriptHash}.runtimeconfig.json"
 
-    let exe = outputDir /+ $"{thisHash}.exe"
-    let cfg = outputDir /+ $"{thisHash}.runtimeconfig.json"
-
-    if cryptography_workaround then
-        let fsx_tmp = outputDir /+ $"{thisHash}.fsx"
-        let text = File.ReadAllText(opts.script)
-        let workaround = "#r \"System.Security.Cryptography\""
-        File.WriteAllText(fsx_tmp, workaround+"\n"+text)
-        script <- fsx_tmp
+    let fsx_tmp = cacheDir /+ $"{scriptHash}.fsx"
+    // dotnet 7 issue with fsc needs this imported if used
+    // no impact if included twice i think?
+    let workaround_text = "#r \"System.Security.Cryptography\"\n"+File.ReadAllText(opts.script)
+    File.WriteAllText(fsx_tmp, workaround_text)
 
     let cache' = Map.tryFind script caches
     let cacheDone = DateTime.Now
     printIfVerbose $"cache load time: {cacheDone - startupDone}"
     match cache' with
-    | Some cache when not opts.forceRebuild && cache.srcHash = thisHash ->
+    | Some cache when not opts.forceRebuild && cache.srcHash = scriptHash ->
         printIfVerbose "found cached version"
     | x ->
         match x with
         | Some outdated ->
             printIfVerbose "deleting out of date exe and config"
-            File.Delete (outputDir /+ $"{outdated.srcHash}.exe")
-            File.Delete (outputDir /+ $"{outdated.srcHash}.runtimeconfig.json")
+            File.Delete (cacheDir /+ $"{outdated.srcHash}.exe")
+            File.Delete (cacheDir /+ $"{outdated.srcHash}.runtimeconfig.json")
         | _ -> ()
         printIfVerbose "cache was out of date, building"
-        let sdkpath = "C:/Program Files/dotnet/sdk" /+ globalDotnetOptions.sdk.version
+        let sdkpath = findSdkDir dotnetVersion
+        let fsharpc = sdkpath /+ "FSharp" /+ "fsc.dll"
         let buildargs = [
-            "\"" + sdkpath /+ "FSharp/fsc.dll" + "\""
-            "--targetprofile:netstandard"
+            "\"" + fsharpc + "\""
+            "--targetprofile:netcore"
             "--langversion:7.0"
             if not opts.verbose then "--nologo"
             $"--out:{exe}"
-            script
+            fsx_tmp
         ]
-        let buildProc = Process.Start("dotnet", String.Join(" ", buildargs))
-        buildProc.WaitForExit()
-        if buildProc.ExitCode <> 0 then
-            printIfVerbose "build failed"
-            Environment.Exit buildProc.ExitCode
-        else
-            printIfVerbose "build succeeded"
+        run "dotnet" (String.Join(" ", buildargs)) |> printfn "%s" 
         File.Copy(cacheDir /+ "runtimeconfig.json", cfg)
         let buildDone = DateTime.Now
         printIfVerbose $"build time: {buildDone - cacheDone}"
         let cache = {
             pathToSrc = script
-            srcHash = thisHash
+            srcHash = scriptHash
         }
         Map.change script (fun _ -> Some cache) caches
-        // |> Map.toSeq |> Seq.map snd
         |> Map.values
         |> Array.ofSeq
         |> fun o -> JsonSerializer.Serialize(o, prettySerializeopts)
@@ -213,7 +178,7 @@ match opts with
         exit runProc.ExitCode
 | Error msg ->
     Console.ForegroundColor <- ConsoleColor.Red
-    Console.Write $"error: {msg}\n"
+    printfn $"error: {msg}\n"
     Console.ResetColor()
     printfn $"{usage}"
     exit 1
